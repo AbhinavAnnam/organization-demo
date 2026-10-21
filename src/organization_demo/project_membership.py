@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 
 class ProjectNotFoundException(Exception):
@@ -113,6 +114,8 @@ class Project:
     members: dict[str, ProjectMember] = field(default_factory=dict)
     work_items: dict[str, WorkItem] = field(default_factory=dict)
     activity_records: list[dict[str, Any]] = field(default_factory=list)
+    comments: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    attachments: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 
 class ProjectMembershipManager:
@@ -134,6 +137,14 @@ class ProjectMembershipManager:
         )
         return escaped
 
+    def _get_utc_now(self, timezone_str: str = "UTC") -> datetime:
+        """Return timezone-aware current time accounting for daylight saving shifts using zoneinfo."""
+        try:
+            tz = ZoneInfo(timezone_str)
+        except Exception:
+            tz = timezone.utc
+        return datetime.now(tz)
+
     def create_project(
         self,
         project_id: str,
@@ -143,12 +154,14 @@ class ProjectMembershipManager:
         owner_id: str,
         description: str = "",
         due_date: Optional[date] = None,
+        timezone_str: str = "UTC",
     ) -> Project:
         """Create a new project within an organization."""
         if not project_id or not organization_name or not name or not creator_id or not owner_id:
             raise ValidationError("Project ID, organization name, name, creator ID, and owner ID are required.")
         
         sanitized_description = self._sanitize_description(description)
+        now_dt = self._get_utc_now(timezone_str)
         
         members = {
             owner_id: ProjectMember(user_id=owner_id, is_owner=True)
@@ -164,6 +177,8 @@ class ProjectMembershipManager:
             owner_id=owner_id,
             description=sanitized_description,
             due_date=due_date,
+            created_at=now_dt,
+            updated_at=now_dt,
             members=members
         )
         self._projects[project_id] = project
@@ -171,6 +186,8 @@ class ProjectMembershipManager:
 
     def get_project(self, project_id: str, organization_name: str) -> Project:
         """Retrieve a project by ID and verify organization tenant isolation."""
+        if not project_id:
+            raise MalformedWorkItemException("Project ID is malformed or missing.")
         if project_id not in self._projects:
             raise ProjectNotFoundException(f"Project with ID '{project_id}' not found.")
         project = self._projects[project_id]
@@ -186,6 +203,7 @@ class ProjectMembershipManager:
         user_id: str,
         is_owner: bool = False,
         org_members: Optional[list[str]] = None,
+        timezone_str: str = "UTC",
     ) -> ProjectMember:
         """Add a member to a project. Enforces project ownership permissions and organization membership."""
         project = self.get_project(project_id, organization_name)
@@ -201,7 +219,7 @@ class ProjectMembershipManager:
 
         member = ProjectMember(user_id=user_id, is_owner=is_owner)
         project.members[user_id] = member
-        project.updated_at = datetime.now(timezone.utc)
+        project.updated_at = self._get_utc_now(timezone_str)
         return member
 
     def remove_project_member(
@@ -210,6 +228,7 @@ class ProjectMembershipManager:
         organization_name: str,
         actor_id: str,
         user_id: str,
+        timezone_str: str = "UTC",
     ) -> None:
         """Remove a member from a project, ensuring owners cannot be removed without another owner."""
         project = self.get_project(project_id, organization_name)
@@ -227,23 +246,30 @@ class ProjectMembershipManager:
                 raise ProjectOwnerRequiredException("Cannot remove the last project owner without designating another owner.")
 
         del project.members[user_id]
-        project.updated_at = datetime.now(timezone.utc)
+        project.updated_at = self._get_utc_now(timezone_str)
 
-    def archive_project(self, project_id: str, organization_name: str, actor_id: str) -> Project:
+    def archive_project(self, project_id: str, organization_name: str, actor_id: str, timezone_str: str = "UTC") -> Project:
         """Archive a project rather than permanently deleting it."""
         project = self.get_project(project_id, organization_name)
         if actor_id not in project.members or not project.members[actor_id].is_owner:
             raise UnauthorizedObjectAccessException("Only project owners can archive projects.")
         
         project.status = "archived"
-        project.updated_at = datetime.now(timezone.utc)
+        project.updated_at = self._get_utc_now(timezone_str)
         return project
 
     def delete_project(self, project_id: str, organization_name: str, actor_id: str) -> None:
-        """Permanently delete a project and clean up dependent work items and history."""
+        """Permanently delete a project and clean up dependent work items, comments, attachments, and activity records."""
         project = self.get_project(project_id, organization_name)
         if actor_id not in project.members or not project.members[actor_id].is_owner:
             raise UnauthorizedObjectAccessException("Only project owners can delete projects.")
+        
+        # Clean up dependent work items, comments, attachments, and activity records
+        project.work_items.clear()
+        project.comments.clear()
+        project.attachments.clear()
+        project.activity_records.clear()
+        project.members.clear()
         
         del self._projects[project_id]
 
@@ -260,8 +286,12 @@ class ProjectMembershipManager:
         due_date: Optional[date] = None,
         description: str = "",
         position: int = 0,
+        timezone_str: str = "UTC",
     ) -> WorkItem:
         """Create a work item within a project."""
+        if not work_item_id:
+            raise MalformedWorkItemException("Work item ID cannot be empty.")
+        
         project = self.get_project(project_id, organization_name)
         if actor_id not in project.members:
             raise UnauthorizedObjectAccessException("User is not a member of this project.")
@@ -278,6 +308,7 @@ class ProjectMembershipManager:
             raise ValidationError("Assignee must be a project member.")
 
         sanitized_desc = self._sanitize_description(description)
+        now_dt = self._get_utc_now(timezone_str)
 
         work_item = WorkItem(
             id=work_item_id,
@@ -289,17 +320,19 @@ class ProjectMembershipManager:
             description=sanitized_desc,
             position=position,
             version=1,
+            created_at=now_dt,
+            updated_at=now_dt,
         )
         
         work_item.history.append({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": now_dt.isoformat(),
             "actor_id": actor_id,
             "action": "created",
             "changes": {"title": title, "status": status}
         })
 
         project.work_items[work_item_id] = work_item
-        project.updated_at = datetime.now(timezone.utc)
+        project.updated_at = now_dt
         return work_item
 
     def update_work_item(
@@ -317,13 +350,14 @@ class ProjectMembershipManager:
         description: Optional[str] = None,
         position: Optional[int] = None,
         expected_version: Optional[int] = None,
+        timezone_str: str = "UTC",
     ) -> WorkItem:
         """Update a work item's fields and record historical changes with optimistic concurrency locking."""
         project = self.get_project(project_id, organization_name)
         if actor_id not in project.members:
             raise UnauthorizedObjectAccessException("User is not a member of this project.")
 
-        if work_item_id not in project.work_items:
+        if not work_item_id or work_item_id not in project.work_items:
             raise MalformedWorkItemException(f"Work item '{work_item_id}' not found in project.")
 
         work_item = project.work_items[work_item_id]
@@ -336,7 +370,7 @@ class ProjectMembershipManager:
         changes: dict[str, Any] = {}
 
         if title is not None:
-            if not title.strip():
+            if not isinstance(title, str) or not title.strip():
                 raise ValidationError("Work item title cannot be empty.")
             changes["title"] = {"old": work_item.title, "new": title}
             work_item.title = title
@@ -379,15 +413,16 @@ class ProjectMembershipManager:
             work_item.position = position
 
         if changes:
+            now_dt = self._get_utc_now(timezone_str)
             work_item.version += 1
-            work_item.updated_at = datetime.now(timezone.utc)
+            work_item.updated_at = now_dt
             work_item.history.append({
-                "timestamp": work_item.updated_at.isoformat(),
+                "timestamp": now_dt.isoformat(),
                 "actor_id": actor_id,
                 "action": "updated",
                 "changes": changes,
                 "version": work_item.version
             })
-            project.updated_at = datetime.now(timezone.utc)
+            project.updated_at = now_dt
 
         return work_item

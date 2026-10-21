@@ -2,8 +2,9 @@ import uuid
 import datetime
 import html
 import os
+import threading
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 
 # ----------------------------------------------------------------------
 # Exceptions
@@ -69,7 +70,8 @@ class Comment:
 # ----------------------------------------------------------------------
 class CommentService:
     """
-    In-memory comment and attachment management service.
+    In-memory comment and attachment management service with thread safety
+    and project membership validation.
     """
 
     MAX_FILE_SIZE_BYTES: int = 10 * 1024 * 1024  # 10 MB limit
@@ -79,6 +81,17 @@ class CommentService:
         self._comments: Dict[uuid.UUID, List[Comment]] = {}
         # Maps attachment_id -> Attachment
         self._attachments: Dict[uuid.UUID, Attachment] = {}
+        # Maps attachment_id -> work_item_id mapping for membership checks
+        self._attachment_work_items: Dict[uuid.UUID, uuid.UUID] = {}
+        # Maps work_item_id -> set of authorized project member account IDs
+        self._project_members: Dict[uuid.UUID, Set[uuid.UUID]] = {}
+        # Thread lock for concurrent updates/mutations
+        self._lock = threading.Lock()
+
+    def set_project_members(self, work_item_id: uuid.UUID, member_ids: Set[uuid.UUID]) -> None:
+        """Configure project membership for a work item to validate attachment access."""
+        with self._lock:
+            self._project_members[work_item_id] = set(member_ids)
 
     # ------------------------------------------------------------------
     # Comment Operations
@@ -90,14 +103,15 @@ class CommentService:
         content: str,
     ) -> Comment:
         """Create and store a new comment on the specified work item."""
-        comment = Comment(
-            id=uuid.uuid4(),
-            author_id=author_id,
-            content=content,
-            created_at=datetime.datetime.utcnow(),
-        )
-        self._comments.setdefault(work_item_id, []).append(comment)
-        return comment
+        with self._lock:
+            comment = Comment(
+                id=uuid.uuid4(),
+                author_id=author_id,
+                content=content,
+                created_at=datetime.datetime.now(datetime.timezone.utc),
+            )
+            self._comments.setdefault(work_item_id, []).append(comment)
+            return comment
 
     def edit_comment(
         self,
@@ -108,22 +122,23 @@ class CommentService:
         is_admin: bool = False,
     ) -> Comment:
         """Edit an existing comment if the editor is the author or an admin."""
-        comment = self._find_comment(work_item_id, comment_id)
-        if comment.author_id != editor_id and not is_admin:
-            raise ModerationPermissionException(
-                "Only the author or an administrator can edit this comment."
+        with self._lock:
+            comment = self._find_comment(work_item_id, comment_id)
+            if comment.author_id != editor_id and not is_admin:
+                raise ModerationPermissionException(
+                    "Only the author or an administrator can edit this comment."
+                )
+            updated = Comment(
+                id=comment.id,
+                author_id=comment.author_id,
+                content=new_content,
+                created_at=comment.created_at,
+                edited_at=datetime.datetime.now(datetime.timezone.utc),
+                deleted=comment.deleted,
+                attachments=comment.attachments,
             )
-        updated = Comment(
-            id=comment.id,
-            author_id=comment.author_id,
-            content=new_content,
-            created_at=comment.created_at,
-            edited_at=datetime.datetime.utcnow(),
-            deleted=comment.deleted,
-            attachments=comment.attachments,
-        )
-        self._replace_comment(work_item_id, updated)
-        return updated
+            self._replace_comment(work_item_id, updated)
+            return updated
 
     def delete_comment(
         self,
@@ -133,21 +148,22 @@ class CommentService:
         is_admin: bool = False,
     ) -> None:
         """Mark a comment as deleted; content remains in history."""
-        comment = self._find_comment(work_item_id, comment_id)
-        if comment.author_id != deleter_id and not is_admin:
-            raise ModerationPermissionException(
-                "Only the author or an administrator can delete this comment."
+        with self._lock:
+            comment = self._find_comment(work_item_id, comment_id)
+            if comment.author_id != deleter_id and not is_admin:
+                raise ModerationPermissionException(
+                    "Only the author or an administrator can delete this comment."
+                )
+            deleted_comment = Comment(
+                id=comment.id,
+                author_id=comment.author_id,
+                content=comment.content,
+                created_at=comment.created_at,
+                edited_at=comment.edited_at,
+                deleted=True,
+                attachments=comment.attachments,
             )
-        deleted_comment = Comment(
-            id=comment.id,
-            author_id=comment.author_id,
-            content=comment.content,
-            created_at=comment.created_at,
-            edited_at=comment.edited_at,
-            deleted=True,
-            attachments=comment.attachments,
-        )
-        self._replace_comment(work_item_id, deleted_comment)
+            self._replace_comment(work_item_id, deleted_comment)
 
     def list_comments(
         self,
@@ -155,10 +171,11 @@ class CommentService:
         include_deleted: bool = False,
     ) -> List[Comment]:
         """Return comments for a work item, optionally including deleted ones."""
-        comments = self._comments.get(work_item_id, [])
-        if include_deleted:
-            return list(comments)
-        return [c for c in comments if not c.deleted]
+        with self._lock:
+            comments = self._comments.get(work_item_id, [])
+            if include_deleted:
+                return list(comments)
+            return [c for c in comments if not c.deleted]
 
     def get_comment(
         self,
@@ -167,10 +184,11 @@ class CommentService:
         include_deleted: bool = False,
     ) -> Comment:
         """Retrieve a specific comment."""
-        comment = self._find_comment(work_item_id, comment_id)
-        if comment.deleted and not include_deleted:
-            raise CommentNotFoundException("Comment has been deleted.")
-        return comment
+        with self._lock:
+            comment = self._find_comment(work_item_id, comment_id)
+            if comment.deleted and not include_deleted:
+                raise CommentNotFoundException("Comment has been deleted.")
+            return comment
 
     # ------------------------------------------------------------------
     # Attachment Operations
@@ -194,40 +212,41 @@ class CommentService:
             )
         if self._contains_path_traversal(display_name):
             raise PathTraversalException("File name contains unsafe path components.")
-        attachment = Attachment(
-            id=uuid.uuid4(),
-            display_name=display_name,
-            storage_id=storage_id,
-            size_bytes=size_bytes,
-            uploaded_at=datetime.datetime.utcnow(),
-        )
-        self._attachments[attachment.id] = attachment
-        # Link to comment or work item
-        if comment_id:
-            comment = self._find_comment(work_item_id, comment_id)
-            updated = Comment(
-                id=comment.id,
-                author_id=comment.author_id,
-                content=comment.content,
-                created_at=comment.created_at,
-                edited_at=comment.edited_at,
-                deleted=comment.deleted,
-                attachments=comment.attachments + [attachment],
+        
+        with self._lock:
+            attachment = Attachment(
+                id=uuid.uuid4(),
+                display_name=display_name,
+                storage_id=storage_id,
+                size_bytes=size_bytes,
+                uploaded_at=datetime.datetime.now(datetime.timezone.utc),
             )
-            self._replace_comment(work_item_id, updated)
-        else:
-            # Attachments directly to work item are stored in a special comment with id None
-            # For simplicity, we store them in a dedicated list per work item
-            self._comments.setdefault(work_item_id, []).append(
-                Comment(
-                    id=uuid.uuid4(),
-                    author_id=uploader_id,
-                    content="",
-                    created_at=datetime.datetime.utcnow(),
-                    attachments=[attachment],
+            self._attachments[attachment.id] = attachment
+            self._attachment_work_items[attachment.id] = work_item_id
+
+            if comment_id:
+                comment = self._find_comment(work_item_id, comment_id)
+                updated = Comment(
+                    id=comment.id,
+                    author_id=comment.author_id,
+                    content=comment.content,
+                    created_at=comment.created_at,
+                    edited_at=comment.edited_at,
+                    deleted=comment.deleted,
+                    attachments=comment.attachments + [attachment],
                 )
-            )
-        return attachment
+                self._replace_comment(work_item_id, updated)
+            else:
+                self._comments.setdefault(work_item_id, []).append(
+                    Comment(
+                        id=uuid.uuid4(),
+                        author_id=uploader_id,
+                        content="",
+                        created_at=datetime.datetime.now(datetime.timezone.utc),
+                        attachments=[attachment],
+                    )
+                )
+            return attachment
 
     def delete_attachment(
         self,
@@ -236,23 +255,23 @@ class CommentService:
         is_admin: bool = False,
     ) -> None:
         """Mark an attachment as deleted; historical record remains."""
-        attachment = self._attachments.get(attachment_id)
-        if not attachment:
-            raise AttachmentNotFoundException("Attachment does not exist.")
-        # For simplicity, we do not track ownership; admins can delete
-        if not is_admin:
-            raise UnauthorizedAttachmentAccessException(
-                "Only administrators can delete attachments."
+        with self._lock:
+            attachment = self._attachments.get(attachment_id)
+            if not attachment:
+                raise AttachmentNotFoundException("Attachment does not exist.")
+            if not is_admin:
+                raise UnauthorizedAttachmentAccessException(
+                    "Only administrators can delete attachments."
+                )
+            deleted = Attachment(
+                id=attachment.id,
+                display_name=attachment.display_name,
+                storage_id=attachment.storage_id,
+                size_bytes=attachment.size_bytes,
+                uploaded_at=attachment.uploaded_at,
+                deleted=True,
             )
-        deleted = Attachment(
-            id=attachment.id,
-            display_name=attachment.display_name,
-            storage_id=attachment.storage_id,
-            size_bytes=attachment.size_bytes,
-            uploaded_at=attachment.uploaded_at,
-            deleted=True,
-        )
-        self._attachments[attachment_id] = deleted
+            self._attachments[attachment_id] = deleted
 
     def get_attachment(
         self,
@@ -260,16 +279,28 @@ class CommentService:
         requester_id: uuid.UUID,
         is_admin: bool = False,
     ) -> Attachment:
-        """Retrieve an attachment if the requester is authorized."""
-        attachment = self._attachments.get(attachment_id)
-        if not attachment or attachment.deleted:
-            raise AttachmentNotFoundException("Attachment not found.")
-        # Authorization: in real system, check work item/project membership
-        if not is_admin:
-            raise UnauthorizedAttachmentAccessException(
-                "User is not authorized to access this attachment."
-            )
-        return attachment
+        """Retrieve an attachment if the requester is authorized via project membership or admin status."""
+        with self._lock:
+            attachment = self._attachments.get(attachment_id)
+            if not attachment or attachment.deleted:
+                raise AttachmentNotFoundException("Attachment not found.")
+            
+            if is_admin:
+                return attachment
+
+            work_item_id = self._attachment_work_items.get(attachment_id)
+            if not work_item_id:
+                raise UnauthorizedAttachmentAccessException(
+                    "User is not authorized to access this attachment."
+                )
+
+            members = self._project_members.get(work_item_id, set())
+            if requester_id not in members:
+                raise UnauthorizedAttachmentAccessException(
+                    "User is not authorized to access this attachment."
+                )
+
+            return attachment
 
     # ------------------------------------------------------------------
     # Internal Helpers

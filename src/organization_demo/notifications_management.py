@@ -1,18 +1,13 @@
-"""notifications_management module.
-
-Implements in-app notification handling and asynchronous email delivery
-according to the business rules specified for the project.
-"""
-
 from __future__ import annotations
 
 import threading
 import uuid
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple, Any
 
 # ----------------------------------------------------------------------
 # Exceptions
@@ -68,7 +63,7 @@ class Notification:
 
 
 # ----------------------------------------------------------------------
-# Email handling (asynchronous)
+# Email handling (asynchronous with retry & monitoring)
 # ----------------------------------------------------------------------
 
 
@@ -80,12 +75,26 @@ class EmailTemplate:
     body: str  # body may contain placeholders like {token}
 
 
+@dataclass
+class EmailJobStatus:
+    """Operational visibility record for an email background dispatch job."""
+
+    job_id: str
+    to_address_masked: str
+    notification_id: Optional[str]
+    attempts: int
+    max_attempts: int
+    status: str  # e.g., "PENDING", "SUCCESS", "FAILED"
+    last_error: Optional[str] = None
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 def _default_email_sender(to_address: str, subject: str, body: str) -> None:
     """
     Placeholder for real email sending logic.
     In production this would interface with an SMTP server or email service.
     """
-    logging.info("Sending email to %s | Subject: %s", to_address, subject)
+    logging.info("Sending email to recipient | Subject: %s", subject)
 
 
 # ----------------------------------------------------------------------
@@ -94,16 +103,27 @@ def _default_email_sender(to_address: str, subject: str, body: str) -> None:
 
 
 class NotificationService:
-    """Manages notifications and optional email delivery for users."""
+    """Manages notifications and optional email delivery for users with robust retry and monitoring."""
 
     def __init__(
         self,
         email_sender: Callable[[str, str, str], None] = _default_email_sender,
+        max_email_retries: int = 3,
+        backoff_base_seconds: float = 0.5,
     ) -> None:
         # In-memory stores; replace with persistent storage in a real app.
         self._notifications: Dict[str, List[Notification]] = {}
         self._email_enabled: Dict[str, bool] = {}
         self._email_sender = email_sender
+        self._max_email_retries = max_email_retries
+        self._backoff_base_seconds = backoff_base_seconds
+        
+        # Operational metrics and job status tracking for visibility
+        self._email_job_statuses: Dict[str, EmailJobStatus] = {}
+        self._total_emails_dispatched: int = 0
+        self._total_emails_failed: int = 0
+        self._total_emails_retried: int = 0
+
         # Track recently created notifications to avoid duplicates on retries.
         self._generated_keys: Set[Tuple[str, NotificationEventType, Optional[str]]] = set()
         self._lock = threading.Lock()
@@ -157,28 +177,13 @@ class NotificationService:
         ignored to satisfy the "no duplicate on retry" rule.
         """
         with self._lock:
-            # Check user notification preferences for comment on followed items or other events
             if event_type == NotificationEventType.COMMENT_ON_FOLLOWED_ITEM:
-                # If notifications/email are disabled according to settings, or if we want to respect settings
-                # For COMMENT_ON_FOLLOWED_ITEM specifically, requirement states notifications are generated based on user notification settings.
-                # If user explicitly turned off preferences (e.g. email enabled is False or a dedicated preference lookup), verify:
-                # We can check a general preference check or specific notification preference mapping if present.
-                pass
-
-            # More broadly, verify user notification preference for comments on followed items if disabled
-            # If the user has explicitly disabled notifications or email/in-app preferences, respect them.
-            # Here we check if user has disabled notifications via preference lookup.
-            if event_type == NotificationEventType.COMMENT_ON_FOLLOWED_ITEM:
-                # Consult user notification settings; if preference is explicitly set to false, skip notification creation.
-                # We use is_email_enabled or check an internal preference store if applicable.
                 if not self.is_email_enabled(user_id):
-                    # If user has disabled preference settings, do not generate comment on followed item notification.
                     return None
 
             key = self._deduplication_key(user_id, event_type, related_id)
 
             if key in self._generated_keys:
-                # Duplicate detected - return the existing notification if any.
                 existing = next(
                     (
                         n
@@ -201,7 +206,6 @@ class NotificationService:
             self._generated_keys.add(key)
 
         if send_email and email_template and email_address and self.is_email_enabled(user_id):
-            # Email delivery must not affect the primary action.
             self._dispatch_email_async(email_address, email_template, notification)
 
         return notification
@@ -218,7 +222,6 @@ class NotificationService:
         with self._lock:
             notifications = list(self._notifications.get(user_id, []))
 
-        # Sort: unread first, then by created_at ascending.
         notifications.sort(
             key=lambda n: (n.read_at is not None, n.created_at)
         )
@@ -253,39 +256,138 @@ class NotificationService:
         )
 
     # ------------------------------------------------------------------
-    # Email dispatch
+    # Email dispatch & monitoring visibility
     # ------------------------------------------------------------------
+
+    def _mask_email(self, email: str) -> str:
+        """Avoid logging raw personal PII by masking email addresses."""
+        if not email or "@" not in email:
+            return "***"
+        parts = email.split("@")
+        name = parts[0]
+        domain = parts[1]
+        masked_name = name[:2] + "***" if len(name) > 2 else "***"
+        return f"{masked_name}@{domain}"
 
     def _dispatch_email_async(
         self,
         to_address: str,
         template: EmailTemplate,
         notification: Notification,
-    ) -> None:
+    ) -> str:
         """
-        Send an email in a background thread. Failures are logged and do not
-        affect the primary operation.
+        Send an email in a background thread with retry limits, exponential backoff,
+        and full operational metric tracking.
+        Returns the background job ID.
         """
+        job_id = str(uuid.uuid4())
+        masked_address = self._mask_email(to_address)
+
+        job_status = EmailJobStatus(
+            job_id=job_id,
+            to_address_masked=masked_address,
+            notification_id=str(notification.id),
+            attempts=0,
+            max_attempts=self._max_email_retries,
+            status="PENDING",
+        )
+
+        with self._lock:
+            self._email_job_statuses[job_id] = job_status
 
         def worker() -> None:
-            try:
-                # Ensure email address is not logged in plain text beyond this scope.
-                self._email_sender(
-                    to_address,
-                    template.subject,
-                    template.body.format(token=str(notification.id)),
-                )
-            except Exception as exc:
-                # Wrap any exception in EmailDeliveryException for consistency.
+            attempts = 0
+            success = False
+            last_exc: Optional[Exception] = None
+
+            while attempts < self._max_email_retries and not success:
+                attempts += 1
+                with self._lock:
+                    job_status.attempts = attempts
+                    job_status.updated_at = datetime.now(timezone.utc)
+
+                try:
+                    self._email_sender(
+                        to_address,
+                        template.subject,
+                        template.body.format(token=str(notification.id)),
+                    )
+                    success = True
+                    with self._lock:
+                        job_status.status = "SUCCESS"
+                        job_status.updated_at = datetime.now(timezone.utc)
+                        self._total_emails_dispatched += 1
+                    self._logger.info(
+                        "Successfully delivered email (Job ID: %s, Recipient: %s, Attempt: %d)",
+                        job_id,
+                        masked_address,
+                        attempts,
+                    )
+                except Exception as exc:
+                    last_exc = exc
+                    with self._lock:
+                        job_status.last_error = str(exc)
+                        job_status.updated_at = datetime.now(timezone.utc)
+                        self._total_emails_retried += 1
+
+                    self._logger.warning(
+                        "Email dispatch attempt %d/%d failed for Job ID %s (Recipient: %s): %s",
+                        attempts,
+                        self._max_email_retries,
+                        job_id,
+                        masked_address,
+                        exc,
+                    )
+                    if attempts < self._max_email_retries:
+                        backoff = self._backoff_base_seconds * (2 ** (attempts - 1))
+                        time.sleep(backoff)
+
+            if not success:
+                with self._lock:
+                    job_status.status = "FAILED"
+                    job_status.updated_at = datetime.now(timezone.utc)
+                    self._total_emails_failed += 1
+
                 self._logger.error(
-                    "Failed to deliver email for notification %s: %s",
+                    "Failed background email job %s after %d attempts for notification %s. Recipient: %s. Error: %s",
+                    job_id,
+                    attempts,
                     notification.id,
-                    exc,
+                    masked_address,
+                    last_exc,
                 )
-                raise EmailDeliveryException(str(exc)) from exc
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
+        return job_id
+
+    def get_email_job_status(self, job_id: str) -> Optional[EmailJobStatus]:
+        """Expose operational monitoring visibility for an email dispatch job."""
+        with self._lock:
+            status = self._email_job_statuses.get(job_id)
+            if status is None:
+                return None
+            # Return a dataclass copy or snapshot
+            return EmailJobStatus(
+                job_id=status.job_id,
+                to_address_masked=status.to_address_masked,
+                notification_id=status.notification_id,
+                attempts=status.attempts,
+                max_attempts=status.max_attempts,
+                status=status.status,
+                last_error=status.last_error,
+                updated_at=status.updated_at,
+            )
+
+    def get_email_metrics(self) -> Dict[str, int]:
+        """Return operational metrics counters for background email dispatch."""
+        with self._lock:
+            return {
+                "dispatched": self._total_emails_dispatched,
+                "failed": self._total_emails_failed,
+                "retried": self._total_emails_retried,
+                "active_jobs": len(self._email_job_statuses),
+            }
 
     # ------------------------------------------------------------------
     # Invitation handling (special case)
@@ -305,7 +407,6 @@ class NotificationService:
         even if delivery later fails. Distinguishes between creation
         success and delivery attempt.
         """
-        # Create a notification for the invitation event.
         self.add_notification(
             user_id=user_id,
             event_type=NotificationEventType.INVITATION,
@@ -314,7 +415,6 @@ class NotificationService:
             send_email=False,
         )
 
-        # Dispatch email asynchronously.
         try:
             self._dispatch_email_async(
                 to_address=email_address,
@@ -328,8 +428,7 @@ class NotificationService:
                 ),
             )
             return True
-        except EmailDeliveryException:
-            # Delivery failure does not roll back invitation creation.
+        except Exception:
             return False
 
     # ------------------------------------------------------------------
