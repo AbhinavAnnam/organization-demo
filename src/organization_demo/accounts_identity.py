@@ -428,7 +428,7 @@ class AccountsIdentityDirectory:
         if invitation.expires_at < datetime.now(timezone.utc):
             raise InvitationExpiredException("Invitation has expired.")
 
-        if invitation.email != account.email:
+        if invitation.email.strip().lower() != account.email.strip().lower():
             raise OrganizationAccessDeniedException("Invitation email does not match authenticated account.")
 
         org_id = invitation.organization_id

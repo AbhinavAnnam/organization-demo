@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 try:
@@ -24,6 +24,36 @@ class ActivityLogImmutableException(Exception):
     """Raised when an attempt is made to modify an immutable activity record."""
 
 
+def compute_relative_time_label(target_dt: datetime, current_dt: datetime | None = None) -> str:
+    """Compute relative time labels ('today', 'tomorrow', 'yesterday', or formatted date) dynamically."""
+    if current_dt is None:
+        current_dt = datetime.now(timezone.utc)
+    
+    if target_dt.tzinfo is not None and current_dt.tzinfo is not None:
+        target_dt_utc = target_dt.astimezone(timezone.utc)
+        current_dt_utc = current_dt.astimezone(timezone.utc)
+    else:
+        target_dt_utc = target_dt
+        current_dt_utc = current_dt
+
+    t_date = target_dt_utc.date()
+    c_date = current_dt_utc.date()
+    delta_days = (t_date - c_date).days
+
+    if delta_days == 0:
+        return "today"
+    elif delta_days == 1:
+        return "tomorrow"
+    elif delta_days == -1:
+        return "yesterday"
+    elif 1 < delta_days <= 7:
+        return f"in {delta_days} days"
+    elif -7 <= delta_days < -1:
+        return f"{abs(delta_days)} days ago"
+    else:
+        return t_date.isoformat()
+
+
 @dataclass(frozen=True)
 class ActivityEntry:
     """An immutable recorded activity entry."""
@@ -37,6 +67,12 @@ class ActivityEntry:
     target_type: str = ""
     target_id: str = ""
     details: dict[str, Any] = field(default_factory=dict)
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        """Enforce immutability on activity entries."""
+        if hasattr(self, key):
+            raise ActivityLogImmutableException("Activity records are append-only and immutable.")
+        super().__setattr__(key, value)
 
 
 @dataclass
@@ -114,8 +150,13 @@ class SearchService:
         organization_id: str,
         query: str,
         user_project_ids: list[str],
+        limit: int = 50,
+        offset: int = 0,
     ) -> list[SearchResult]:
-        """Search accessible operational content with partial matching and access boundaries."""
+        """Search accessible operational content with partial matching, access boundaries, and pagination."""
+        if not user_id or not organization_id:
+            raise UnauthorizedSearchAccessException("User identity and organization scope are required for searching.")
+
         results: list[SearchResult] = []
         query_lower = query.lower()
         project_ids_set = set(user_project_ids)
@@ -157,7 +198,9 @@ class SearchService:
                     )
                 )
 
-        return results
+        # Stable ordering across pages using item_type and item_id as secondary keys
+        sorted_results = sorted(results, key=lambda x: (x.item_type, x.item_id))
+        return sorted_results[offset:offset + limit]
 
     def record_activity(
         self,
@@ -196,7 +239,7 @@ class SearchService:
             act for act in self._activities
             if act.organization_id == organization_id
         ]
-        # Exclude internal database/system operations from user activity feed if needed
+        # Exclude internal database/system operations from user activity feed
         filtered = [
             act for act in filtered
             if not act.action.startswith("INTERNAL_")
@@ -213,7 +256,6 @@ class SearchService:
         timezone_str: str = "UTC",
     ) -> DashboardSummary:
         """Derive active projects, assigned work, and recent updates for the user dashboard."""
-        # Process organization timezone conversion if ZoneInfo is available and valid
         target_tz = timezone.utc
         if ZoneInfo is not None:
             try:
