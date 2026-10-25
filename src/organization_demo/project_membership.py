@@ -11,6 +11,41 @@ class ProjectNotFoundException(Exception):
     pass
 
 
+class InvalidProjectOperationException(Exception):
+    """Raised when an invalid project operation is attempted."""
+    pass
+
+
+class ProjectOwnerRemovalException(Exception):
+    """Raised when an attempt is made to remove the last project owner."""
+    pass
+
+
+class WorkItemNotFoundException(Exception):
+    """Raised when a specified work item cannot be found."""
+    pass
+
+
+class InvalidStatusTransitionException(Exception):
+    """Raised when an invalid status transition is attempted on a work item."""
+    pass
+
+
+class MalformedIdentifierException(Exception):
+    """Raised when a supplied identifier is malformed."""
+    pass
+
+
+class InvalidStateException(Exception):
+    """Raised when an invalid state is encountered."""
+    pass
+
+
+class UnauthorizedObjectAccessException(Exception):
+    """Raised when access is attempted on an object belonging to another organization or without permission."""
+    pass
+
+
 class OrphanedDataException(Exception):
     """Raised when data integrity issues arise regarding orphaned records."""
     pass
@@ -27,7 +62,7 @@ class AccessRevokedException(Exception):
 
 
 class InvalidStateTransitionException(Exception):
-    """Raised when an invalid state transition is attempted on a work item or project."""
+    """Raised when an invalid state transition is attempted."""
     pass
 
 
@@ -38,11 +73,6 @@ class MalformedWorkItemException(Exception):
 
 class ValidationError(Exception):
     """Raised when input validation fails."""
-    pass
-
-
-class UnauthorizedObjectAccessException(Exception):
-    """Raised when access is attempted on an object belonging to another organization or without permission."""
     pass
 
 
@@ -187,7 +217,7 @@ class ProjectMembershipManager:
     def get_project(self, project_id: str, organization_name: str) -> Project:
         """Retrieve a project by ID and verify organization tenant isolation."""
         if not project_id:
-            raise MalformedWorkItemException("Project ID is malformed or missing.")
+            raise MalformedIdentifierException("Project ID is malformed or missing.")
         if project_id not in self._projects:
             raise ProjectNotFoundException(f"Project with ID '{project_id}' not found.")
         project = self._projects[project_id]
@@ -243,7 +273,7 @@ class ProjectMembershipManager:
         if target_member.is_owner:
             owner_count = sum(1 for m in project.members.values() if m.is_owner)
             if owner_count <= 1:
-                raise ProjectOwnerRequiredException("Cannot remove the last project owner without designating another owner.")
+                raise ProjectOwnerRemovalException("Cannot remove the last project owner without designating another owner.")
 
         del project.members[user_id]
         project.updated_at = self._get_utc_now(timezone_str)
@@ -264,7 +294,6 @@ class ProjectMembershipManager:
         if actor_id not in project.members or not project.members[actor_id].is_owner:
             raise UnauthorizedObjectAccessException("Only project owners can delete projects.")
         
-        # Clean up dependent work items, comments, attachments, and activity records
         project.work_items.clear()
         project.comments.clear()
         project.attachments.clear()
@@ -290,7 +319,7 @@ class ProjectMembershipManager:
     ) -> WorkItem:
         """Create a work item within a project."""
         if not work_item_id:
-            raise MalformedWorkItemException("Work item ID cannot be empty.")
+            raise MalformedIdentifierException("Work item ID cannot be empty.")
         
         project = self.get_project(project_id, organization_name)
         if actor_id not in project.members:
@@ -298,7 +327,7 @@ class ProjectMembershipManager:
 
         valid_statuses = {"not_yet_completed", "in_progress", "completed"}
         if status not in valid_statuses:
-            raise InvalidStateTransitionException(f"Invalid work item status: '{status}'.")
+            raise InvalidStatusTransitionException(f"Invalid work item status: '{status}'.")
 
         valid_priorities = {"low", "medium", "high", "urgent"}
         if priority not in valid_priorities:
@@ -358,7 +387,7 @@ class ProjectMembershipManager:
             raise UnauthorizedObjectAccessException("User is not a member of this project.")
 
         if not work_item_id or work_item_id not in project.work_items:
-            raise MalformedWorkItemException(f"Work item '{work_item_id}' not found in project.")
+            raise WorkItemNotFoundException(f"Work item '{work_item_id}' not found in project.")
 
         work_item = project.work_items[work_item_id]
 
@@ -378,7 +407,7 @@ class ProjectMembershipManager:
         if status is not None:
             valid_statuses = {"not_yet_completed", "in_progress", "completed"}
             if status not in valid_statuses:
-                raise InvalidStateTransitionException(f"Invalid status value: '{status}'.")
+                raise InvalidStatusTransitionException(f"Invalid status value: '{status}'.")
             changes["status"] = {"old": work_item.status, "new": status}
             work_item.status = status
 
