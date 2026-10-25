@@ -126,6 +126,8 @@ class NotificationService:
 
         # Track recently created notifications to avoid duplicates on retries.
         self._generated_keys: Set[Tuple[str, NotificationEventType, Optional[str]]] = set()
+        # Track dispatched email notification IDs to ensure idempotent/deduplicated sending on retries.
+        self._dispatched_email_notification_ids: Set[str] = set()
         self._lock = threading.Lock()
         self._logger = logging.getLogger(__name__)
 
@@ -176,6 +178,8 @@ class NotificationService:
         Duplicate notifications (same user, event type and related_id) are
         ignored to satisfy the "no duplicate on retry" rule.
         """
+        should_dispatch_email = False
+
         with self._lock:
             if event_type == NotificationEventType.COMMENT_ON_FOLLOWED_ITEM:
                 if not self.is_email_enabled(user_id):
@@ -205,7 +209,13 @@ class NotificationService:
             self._notifications.setdefault(user_id, []).append(notification)
             self._generated_keys.add(key)
 
-        if send_email and email_template and email_address and self.is_email_enabled(user_id):
+            if send_email and email_template and email_address and self.is_email_enabled(user_id):
+                note_id_str = str(notification.id)
+                if note_id_str not in self._dispatched_email_notification_ids:
+                    self._dispatched_email_notification_ids.add(note_id_str)
+                    should_dispatch_email = True
+
+        if should_dispatch_email and email_template and email_address:
             self._dispatch_email_async(email_address, email_template, notification)
 
         return notification
@@ -367,7 +377,6 @@ class NotificationService:
             status = self._email_job_statuses.get(job_id)
             if status is None:
                 return None
-            # Return a dataclass copy or snapshot
             return EmailJobStatus(
                 job_id=status.job_id,
                 to_address_masked=status.to_address_masked,
@@ -401,7 +410,7 @@ class NotificationService:
         template: EmailTemplate,
     ) -> bool:
         """
-        Attempt to send an invitation email.
+        Attempt to send an invitation email with deduplication to prevent duplicate sends on retries.
 
         Returns True if the email was handed off to the async sender,
         even if delivery later fails. Distinguishes between creation
@@ -415,12 +424,24 @@ class NotificationService:
             send_email=False,
         )
 
+        notif_id = uuid.uuid4()
+        notif_id_str = str(notif_id)
+        dispatch_needed = False
+
+        with self._lock:
+            if invitation_token not in self._dispatched_email_notification_ids:
+                self._dispatched_email_notification_ids.add(invitation_token)
+                dispatch_needed = True
+
+        if not dispatch_needed:
+            return True
+
         try:
             self._dispatch_email_async(
                 to_address=email_address,
                 template=template,
                 notification=Notification(
-                    id=uuid.uuid4(),
+                    id=notif_id,
                     user_id=user_id,
                     event_type=NotificationEventType.INVITATION,
                     message="Invitation",

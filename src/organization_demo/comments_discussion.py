@@ -17,6 +17,10 @@ class CommentNotFoundException(Exception):
     """Raised when a requested comment does not exist."""
     pass
 
+class UnauthorizedCommentEditException(Exception):
+    """Raised when a user attempts to edit or delete a comment they do not own or lack authorization for."""
+    pass
+
 class FileTooLargeException(Exception):
     """Raised when an uploaded file exceeds the allowed size limit."""
     pass
@@ -71,7 +75,7 @@ class Comment:
 class CommentService:
     """
     In-memory comment and attachment management service with thread safety
-    and project membership validation.
+    and project membership validation, supporting idempotency keys for safe retries.
     """
 
     MAX_FILE_SIZE_BYTES: int = 10 * 1024 * 1024  # 10 MB limit
@@ -85,6 +89,9 @@ class CommentService:
         self._attachment_work_items: Dict[uuid.UUID, uuid.UUID] = {}
         # Maps work_item_id -> set of authorized project member account IDs
         self._project_members: Dict[uuid.UUID, Set[uuid.UUID]] = {}
+        # Idempotency key tracking maps for safe retries without duplicate records
+        self._comment_idempotency: Dict[str, uuid.UUID] = {}
+        self._attachment_idempotency: Dict[str, uuid.UUID] = {}
         # Thread lock for concurrent updates/mutations
         self._lock = threading.Lock()
 
@@ -101,9 +108,19 @@ class CommentService:
         work_item_id: uuid.UUID,
         author_id: uuid.UUID,
         content: str,
+        idempotency_key: Optional[str] = None,
     ) -> Comment:
-        """Create and store a new comment on the specified work item."""
+        """Create and store a new comment on the specified work item, handling idempotency for retries."""
         with self._lock:
+            if idempotency_key:
+                existing_comment_id = self._comment_idempotency.get(idempotency_key)
+                if existing_comment_id:
+                    # Find and return the existing comment to satisfy idempotency requirement
+                    comments = self._comments.get(work_item_id, [])
+                    for c in comments:
+                        if c.id == existing_comment_id:
+                            return c
+
             comment = Comment(
                 id=uuid.uuid4(),
                 author_id=author_id,
@@ -111,6 +128,10 @@ class CommentService:
                 created_at=datetime.datetime.now(datetime.timezone.utc),
             )
             self._comments.setdefault(work_item_id, []).append(comment)
+            
+            if idempotency_key:
+                self._comment_idempotency[idempotency_key] = comment.id
+
             return comment
 
     def edit_comment(
@@ -125,7 +146,7 @@ class CommentService:
         with self._lock:
             comment = self._find_comment(work_item_id, comment_id)
             if comment.author_id != editor_id and not is_admin:
-                raise ModerationPermissionException(
+                raise UnauthorizedCommentEditException(
                     "Only the author or an administrator can edit this comment."
                 )
             updated = Comment(
@@ -151,7 +172,7 @@ class CommentService:
         with self._lock:
             comment = self._find_comment(work_item_id, comment_id)
             if comment.author_id != deleter_id and not is_admin:
-                raise ModerationPermissionException(
+                raise UnauthorizedCommentEditException(
                     "Only the author or an administrator can delete this comment."
                 )
             deleted_comment = Comment(
@@ -201,10 +222,11 @@ class CommentService:
         display_name: str,
         storage_id: str,
         size_bytes: int,
+        idempotency_key: Optional[str] = None,
     ) -> Attachment:
         """
         Associate an attachment with a work item or a specific comment.
-        Raises FileTooLargeException if size exceeds limit.
+        Raises FileTooLargeException if size exceeds limit. Supports idempotency key for safe retries.
         """
         if size_bytes > self.MAX_FILE_SIZE_BYTES:
             raise FileTooLargeException(
@@ -214,6 +236,13 @@ class CommentService:
             raise PathTraversalException("File name contains unsafe path components.")
         
         with self._lock:
+            if idempotency_key:
+                existing_attachment_id = self._attachment_idempotency.get(idempotency_key)
+                if existing_attachment_id:
+                    existing_att = self._attachments.get(existing_attachment_id)
+                    if existing_att:
+                        return existing_att
+
             attachment = Attachment(
                 id=uuid.uuid4(),
                 display_name=display_name,
@@ -223,6 +252,9 @@ class CommentService:
             )
             self._attachments[attachment.id] = attachment
             self._attachment_work_items[attachment.id] = work_item_id
+
+            if idempotency_key:
+                self._attachment_idempotency[idempotency_key] = attachment.id
 
             if comment_id:
                 comment = self._find_comment(work_item_id, comment_id)
@@ -257,7 +289,7 @@ class CommentService:
         """Mark an attachment as deleted; historical record remains."""
         with self._lock:
             attachment = self._attachments.get(attachment_id)
-            if not attachment:
+            if not attachment or attachment.deleted:
                 raise AttachmentNotFoundException("Attachment does not exist.")
             if not is_admin:
                 raise UnauthorizedAttachmentAccessException(

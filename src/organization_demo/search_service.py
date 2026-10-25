@@ -115,8 +115,9 @@ class SearchService:
         title: str,
         content: str,
         allowed_user_ids: list[str],
+        comments: list[str] | None = None,
     ) -> None:
-        """Asynchronously or synchronously index an operational document for search."""
+        """Asynchronously or synchronously index an operational document for search, including comments."""
         try:
             doc = {
                 "organization_id": organization_id,
@@ -125,6 +126,7 @@ class SearchService:
                 "item_id": item_id,
                 "title": title,
                 "content": content,
+                "comments": comments or [],
                 "allowed_user_ids": set(allowed_user_ids),
                 "is_active": True,
             }
@@ -175,17 +177,31 @@ class SearchService:
 
             title = doc["title"]
             content = doc["content"]
+            comments = doc.get("comments", [])
             title_lower = title.lower()
             content_lower = content.lower()
+            comments_lower = [c.lower() for c in comments]
+
+            matched = False
+            snippet_source = content
 
             if query_lower in title_lower or query_lower in content_lower:
-                # Build snippet context around match
-                snippet = content[:150]
-                if query_lower in content_lower:
-                    idx = content_lower.find(query_lower)
+                matched = True
+            else:
+                for c_text in comments_lower:
+                    if query_lower in c_text:
+                        matched = True
+                        snippet_source = comments[comments_lower.index(c_text)]
+                        break
+
+            if matched:
+                snippet = snippet_source[:150]
+                snippet_lower = snippet_source.lower()
+                if query_lower in snippet_lower:
+                    idx = snippet_lower.find(query_lower)
                     start = max(0, idx - 40)
-                    end = min(len(content), idx + 110)
-                    snippet = content[start:end]
+                    end = min(len(snippet_source), idx + 110)
+                    snippet = snippet_source[start:end]
 
                 results.append(
                     SearchResult(
@@ -239,11 +255,20 @@ class SearchService:
             act for act in self._activities
             if act.organization_id == organization_id
         ]
-        # Exclude internal database/system operations from user activity feed
-        filtered = [
-            act for act in filtered
-            if not act.action.startswith("INTERNAL_")
-        ]
+        
+        # If not admin, exclude high-privilege or sensitive internal/administrative audit events
+        if not is_admin:
+            filtered = [
+                act for act in filtered
+                if not act.action.startswith("ADMIN_") and not act.action.startswith("INTERNAL_")
+            ]
+        else:
+            # Administrators see everything except core internal background system tasks
+            filtered = [
+                act for act in filtered
+                if not act.action.startswith("INTERNAL_")
+            ]
+
         sorted_acts = sorted(filtered, key=lambda x: x.timestamp, reverse=True)
         return sorted_acts[offset:offset + limit]
 
