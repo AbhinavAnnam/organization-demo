@@ -116,6 +116,81 @@ class InsufficientPermissionsException(Exception):
     pass
 
 
+class UnverifiedAccountException(Exception):
+    """Raised when an unverified account attempts restricted operations."""
+    pass
+
+
+class InvalidPasswordResetTokenException(Exception):
+    """Raised when a password reset token is invalid or expired."""
+    pass
+
+
+class EmailAlreadyExistsException(Exception):
+    """Raised when an email is already registered."""
+    pass
+
+
+class DuplicateOrganizationIdentifierException(Exception):
+    """Raised when an organization identifier or slug already exists."""
+    pass
+
+
+class UnauthorizedOrganizationAccessException(Exception):
+    """Raised when access to an organization is unauthorized."""
+    pass
+
+
+class SettingNotFoundException(Exception):
+    """Raised when a requested organization setting is not found."""
+    pass
+
+
+class InvalidSettingValueException(Exception):
+    """Raised when a setting value is invalid."""
+    pass
+
+
+class InsufficientPermissionException(Exception):
+    """Raised when permissions are insufficient for the requested action."""
+    pass
+
+
+class SelfRoleElevationException(Exception):
+    """Raised when a user attempts to elevate their own role."""
+    pass
+
+
+class ProjectNotFoundException(Exception):
+    """Raised when a project is not found."""
+    pass
+
+
+class InvalidProjectOwnerTransferException(Exception):
+    """Raised when transferring project ownership is invalid."""
+    pass
+
+
+class ProjectDeletionBlockedException(Exception):
+    """Raised when project deletion is blocked."""
+    pass
+
+
+class NonOrganizationMemberProjectAddException(Exception):
+    """Raised when attempting to add a non-organization member to a project."""
+    pass
+
+
+class ProjectMemberNotFoundException(Exception):
+    """Raised when a project member is not found."""
+    pass
+
+
+class CannotRemoveLastProjectOwnerException(Exception):
+    """Raised when attempting to remove the last project owner."""
+    pass
+
+
 @dataclass
 class Account:
     """Represents a user account in the system."""
@@ -165,6 +240,7 @@ class ProjectMembership:
     project_id: str
     account_id: str
     organization_id: str
+    role: str = "member"  # 'owner', 'member'
     is_active: bool = True
 
 
@@ -196,8 +272,22 @@ class Organization:
     settings: Dict[str, OrganizationSettingValue] = field(default_factory=dict)
 
 
+@dataclass
+class Project:
+    """Represents a project within an organization."""
+    project_id: str
+    organization_id: str
+    name: str
+    description: str
+    creator_id: str
+    status: str = "active"  # 'active', 'completed', 'archived'
+    due_date: Optional[datetime] = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class AccountsIdentityDirectory:
-    """Central manager for accounts, sessions, organizations, memberships, and RBAC."""
+    """Central manager for accounts, sessions, organizations, projects, memberships, and RBAC."""
 
     def __init__(self) -> None:
         self._accounts: Dict[str, Account] = {}  # account_id -> Account
@@ -206,6 +296,7 @@ class AccountsIdentityDirectory:
         self._organizations: Dict[str, Organization] = {}  # organization_id -> Organization
         self._slug_to_org_id: Dict[str, str] = {}  # slug -> organization_id
         self._memberships: Dict[str, List[Membership]] = {}  # organization_id -> list[Membership]
+        self._projects: Dict[str, Project] = {}  # project_id -> Project
         self._project_memberships: Dict[str, List[ProjectMembership]] = {}  # project_id -> list[ProjectMembership]
         self._invitations: Dict[str, Invitation] = {}  # invitation_id -> Invitation
         self._audit_logs: List[AuditLog] = []
@@ -226,8 +317,7 @@ class AccountsIdentityDirectory:
                     return self._accounts[cached_account_id]
 
             if normalized_email in self._email_to_id:
-                existing_account_id = self._email_to_id[normalized_email]
-                return self._accounts[existing_account_id]
+                raise EmailAlreadyExistsException("An account with this email already exists.")
 
             account_id = secrets.token_hex(8)
             verification_token = secrets.token_urlsafe(32)
@@ -257,17 +347,20 @@ class AccountsIdentityDirectory:
                 if cached_account_id in self._accounts:
                     return self._accounts[cached_account_id]
 
+            target_account = None
             for account in self._accounts.values():
                 if account.verification_token == verification_token:
-                    account.is_verified = True
-                    account.verification_token = None
-                    if idempotency_key:
-                        self._idempotency_records[idempotency_key] = account.account_id
-                    return account
-                if account.is_verified and verification_token == "":
-                    return account
+                    target_account = account
+                    break
 
-            raise VerificationError("Invalid or expired verification token.")
+            if not target_account:
+                raise VerificationError("Invalid or expired verification token.")
+
+            target_account.is_verified = True
+            target_account.verification_token = None
+            if idempotency_key:
+                self._idempotency_records[idempotency_key] = target_account.account_id
+            return target_account
 
     def authenticate(self, email: str, password: str, idempotency_key: Optional[str] = None) -> Session:
         """Authenticate user and return a session token with idempotency support."""
@@ -285,7 +378,7 @@ class AccountsIdentityDirectory:
                 raise InvalidCredentialsException("Invalid email or password.")
 
             if not account.is_verified:
-                raise VerificationRequiredException("Email verification required.")
+                raise UnverifiedAccountException("Email verification required.")
 
             if idempotency_key and idempotency_key in self._idempotency_records:
                 cached_session_id = self._idempotency_records[idempotency_key]
@@ -324,7 +417,7 @@ class AccountsIdentityDirectory:
             return reset_token
 
     def reset_password(self, reset_token: str, new_password: str) -> None:
-        """Reset password using temporary token and invalidate all active sessions for the account."""
+        """Reset password using temporary single-use token and invalidate all active sessions for the account."""
         with self._lock:
             target_account = None
             for account in self._accounts.values():
@@ -333,10 +426,10 @@ class AccountsIdentityDirectory:
                     break
 
             if not target_account:
-                raise AuthenticationError("Invalid or expired password reset token.")
+                raise InvalidPasswordResetTokenException("Invalid or expired password reset token.")
 
             if target_account.password_reset_expires_at and target_account.password_reset_expires_at < datetime.now(timezone.utc):
-                raise AuthenticationError("Password reset token has expired.")
+                raise InvalidPasswordResetTokenException("Password reset token has expired.")
 
             target_account.password_hash = self._hash_password(new_password)
             target_account.password_reset_token = None
@@ -347,7 +440,7 @@ class AccountsIdentityDirectory:
                     session.is_valid = False
 
     def change_password(self, session_id: str, old_password: str, new_password: str) -> None:
-        """Change user password, invalidating sessions upon completion."""
+        """Change user password, invalidating all prior sessions upon completion."""
         with self._lock:
             session = self._sessions.get(session_id)
             if not session or not session.is_valid:
@@ -378,7 +471,7 @@ class AccountsIdentityDirectory:
             return account
 
     def deactivate_account(self, session_id: str) -> None:
-        """Deactivate the user account, cascade deactivation to sessions and project memberships, and invalidate tokens."""
+        """Deactivate the user account, preserving historical references across organizations while revoking access."""
         with self._lock:
             session = self._sessions.get(session_id)
             if not session or not session.is_valid:
@@ -418,8 +511,7 @@ class AccountsIdentityDirectory:
                     return self._organizations[cached_org_id]
 
             if slug and slug in self._slug_to_org_id:
-                existing_org_id = self._slug_to_org_id[slug]
-                return self._organizations[existing_org_id]
+                raise DuplicateOrganizationIdentifierException("Organization slug must be unique.")
 
             org_id = secrets.token_hex(8)
             organization = Organization(
@@ -473,7 +565,7 @@ class AccountsIdentityDirectory:
 
             actor_membership = self._get_membership(organization_id, session.account_id)
             if not actor_membership or not actor_membership.is_active or actor_membership.role not in ("owner", "administrator"):
-                raise InsufficientPermissionsException("Insufficient permissions to invite members.")
+                raise InsufficientPermissionException("Insufficient permissions to invite members.")
 
             if role not in ("administrator", "member"):
                 raise UnauthorizedRoleElevationException("Invalid role assigned during invitation.")
@@ -514,12 +606,12 @@ class AccountsIdentityDirectory:
 
             actor_membership = self._get_membership(invitation.organization_id, session.account_id)
             if not actor_membership or not actor_membership.is_active or actor_membership.role not in ("owner", "administrator"):
-                raise InsufficientPermissionsException("Insufficient permissions to revoke invitations.")
+                raise InsufficientPermissionException("Insufficient permissions to revoke invitations.")
 
             invitation.is_revoked = True
 
     def accept_invitation(self, session_id: str, invitation_id: str) -> Membership:
-        """Accept an organization invitation, adding the user as a member."""
+        """Accept an organization invitation, adding the user as a member without consuming invitations from other orgs."""
         with self._lock:
             session = self._sessions.get(session_id)
             if not session or not session.is_valid:
@@ -539,7 +631,7 @@ class AccountsIdentityDirectory:
                 raise InvitationExpiredException("Invitation has expired.")
 
             if invitation.email.strip().lower() != account.email.strip().lower():
-                raise OrganizationAccessDeniedException("Invitation email does not match authenticated account.")
+                raise UnauthorizedOrganizationAccessException("Invitation email does not match authenticated account.")
 
             org_id = invitation.organization_id
             if org_id not in self._memberships:
@@ -563,11 +655,11 @@ class AccountsIdentityDirectory:
                 is_active=True
             )
             self._memberships[org_id].append(membership)
-            invitation.is_revoked = True  # Consume invitation
+            invitation.is_revoked = True
             return membership
 
     def update_organization_settings(self, session_id: str, organization_id: str, name: Optional[str] = None, timezone_str: Optional[str] = None, settings: Optional[Dict[str, str]] = None) -> Organization:
-        """Update organization workspace settings, distinguishing explicit settings from absent optional ones."""
+        """Update organization workspace settings, scoping configuration to the organization."""
         with self._lock:
             session = self._sessions.get(session_id)
             if not session or not session.is_valid:
@@ -608,7 +700,7 @@ class AccountsIdentityDirectory:
             return organization
 
     def inspect_members(self, session_id: str, organization_id: str, limit: int = 50, offset: int = 0) -> List[Membership]:
-        """Inspect current members and roles with pagination, enforcing administrative authorization and session validity."""
+        """Inspect current active members with pagination, enforcing administrative authorization."""
         with self._lock:
             session = self._sessions.get(session_id)
             if not session or not session.is_valid:
@@ -624,8 +716,65 @@ class AccountsIdentityDirectory:
             active_members = [m for m in self._memberships.get(organization_id, []) if m.is_active]
             return active_members[offset:offset + limit]
 
+    def list_organization_invitations(self, session_id: str, organization_id: str) -> List[Invitation]:
+        """List pending invitations for an organization, distinguishing them from active members."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session or not session.is_valid:
+                raise UnauthorizedException("Invalid or expired session.")
+
+            membership = self._get_membership(organization_id, session.account_id)
+            if not membership or not membership.is_active or membership.role not in ("owner", "administrator"):
+                raise UnauthorizedAdminAccessException("Administrator or owner privileges required.")
+
+            now = datetime.now(timezone.utc)
+            return [inv for inv in self._invitations.values() if inv.organization_id == organization_id and not inv.is_revoked and inv.expires_at > now]
+
+    def update_member_role(self, session_id: str, organization_id: str, target_account_id: str, new_role: str) -> Membership:
+        """Update a member's role ensuring members cannot elevate their own permissions or modify owners."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session or not session.is_valid:
+                raise UnauthorizedException("Invalid or expired session.")
+
+            actor_membership = self._get_membership(organization_id, session.account_id)
+            if not actor_membership or not actor_membership.is_active or actor_membership.role not in ("owner", "administrator"):
+                raise InsufficientPermissionException("Insufficient permissions to modify member roles.")
+
+            if session.account_id == target_account_id:
+                raise SelfRoleElevationException("Users cannot modify their own roles.")
+
+            if new_role not in ("owner", "administrator", "member"):
+                raise InvalidSettingValueException("Invalid role specified.")
+
+            target_membership = self._get_membership(organization_id, target_account_id)
+            if not target_membership or not target_membership.is_active:
+                raise MemberNotFoundException("Target member not found in organization.")
+
+            if target_membership.role == "owner":
+                raise InsufficientPermissionException("Cannot modify organization owner role directly.")
+
+            if actor_membership.role == "administrator" and new_role == "owner":
+                raise InsufficientPermissionException("Administrators cannot promote members to owner.")
+
+            if actor_membership.role == "administrator" and target_membership.role == "administrator":
+                raise InsufficientPermissionException("Administrators cannot modify other administrator roles.")
+
+            target_membership.role = new_role
+
+            self._audit_logs.append(AuditLog(
+                log_id=secrets.token_hex(6),
+                organization_id=organization_id,
+                actor_account_id=session.account_id,
+                action="UPDATE_MEMBER_ROLE",
+                details=f"Updated role for account {target_account_id} to {new_role}",
+                timestamp=datetime.now(timezone.utc)
+            ))
+
+            return target_membership
+
     def remove_member(self, session_id: str, organization_id: str, target_account_id: str) -> None:
-        """Remove a member from an organization immediately preventing access."""
+        """Remove a member from an organization immediately revoking access while preserving audit history."""
         with self._lock:
             session = self._sessions.get(session_id)
             if not session or not session.is_valid:
@@ -636,7 +785,7 @@ class AccountsIdentityDirectory:
                 raise PrivilegeRevokedException("Privileges revoked.")
 
             if actor_membership.role not in ("owner", "administrator"):
-                raise InsufficientPermissionsException("Insufficient permissions to remove members.")
+                raise InsufficientPermissionException("Insufficient permissions to remove members.")
 
             target_membership = self._get_membership(organization_id, target_account_id)
             if not target_membership or not target_membership.is_active:
@@ -646,7 +795,7 @@ class AccountsIdentityDirectory:
                 raise OwnerRemovalException("Cannot remove the organization owner directly without transfer.")
 
             if actor_membership.role == "administrator" and target_membership.role == "administrator":
-                raise InsufficientPermissionsException("Administrators cannot remove other administrators.")
+                raise InsufficientPermissionException("Administrators cannot remove other administrators.")
 
             target_membership.is_active = False
 
@@ -664,8 +813,54 @@ class AccountsIdentityDirectory:
                 timestamp=datetime.now(timezone.utc)
             ))
 
-    def remove_from_project(self, session_id: str, organization_id: str, project_id: str, target_account_id: str) -> None:
-        """Remove a member strictly from a specific project, clearly distinguishing from organization removal."""
+    def create_project(self, session_id: str, organization_id: str, name: str, description: str, due_date: Optional[datetime] = None) -> Project:
+        """Create a project within an organization where the creator becomes the initial project owner."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session or not session.is_valid:
+                raise UnauthorizedException("Invalid or expired session.")
+
+            membership = self._get_membership(organization_id, session.account_id)
+            if not membership or not membership.is_active:
+                raise UnauthorizedOrganizationAccessException("User is not an active member of this organization.")
+
+            project_id = secrets.token_hex(8)
+            now = datetime.now(timezone.utc)
+            project = Project(
+                project_id=project_id,
+                organization_id=organization_id,
+                name=name,
+                description=description,
+                creator_id=session.account_id,
+                status="active",
+                due_date=due_date,
+                created_at=now,
+                updated_at=now
+            )
+            self._projects[project_id] = project
+
+            proj_membership = ProjectMembership(
+                project_id=project_id,
+                account_id=session.account_id,
+                organization_id=organization_id,
+                role="owner",
+                is_active=True
+            )
+            self._project_memberships[project_id] = [proj_membership]
+
+            self._audit_logs.append(AuditLog(
+                log_id=secrets.token_hex(6),
+                organization_id=organization_id,
+                actor_account_id=session.account_id,
+                action="CREATE_PROJECT",
+                details=f"Project {name} created with owner {session.account_id}",
+                timestamp=now
+            ))
+
+            return project
+
+    def add_project_member(self, session_id: str, organization_id: str, project_id: str, target_account_id: str, role: str = "member") -> ProjectMembership:
+        """Add an organization member to a project."""
         with self._lock:
             session = self._sessions.get(session_id)
             if not session or not session.is_valid:
@@ -673,29 +868,127 @@ class AccountsIdentityDirectory:
 
             actor_membership = self._get_membership(organization_id, session.account_id)
             if not actor_membership or not actor_membership.is_active:
-                raise PrivilegeRevokedException("Privileges revoked.")
+                raise UnauthorizedOrganizationAccessException("Access denied.")
+
+            project = self._projects.get(project_id)
+            if not project or project.organization_id != organization_id:
+                raise ProjectNotFoundException("Project not found.")
+
+            actor_proj_mems = self._project_memberships.get(project_id, [])
+            is_proj_owner = any(pm.account_id == session.account_id and pm.role == "owner" and pm.is_active for pm in actor_proj_mems)
+            if actor_membership.role not in ("owner", "administrator") and not is_proj_owner:
+                raise InsufficientPermissionException("Insufficient permissions to add project members.")
+
+            target_org_membership = self._get_membership(organization_id, target_account_id)
+            if not target_org_membership or not target_org_membership.is_active:
+                raise NonOrganizationMemberProjectAddException("Target user is not an active member of the organization.")
+
+            if project_id not in self._project_memberships:
+                self._project_memberships[project_id] = []
+
+            existing_pm = None
+            for pm in self._project_memberships[project_id]:
+                if pm.account_id == target_account_id:
+                    existing_pm = pm
+                    break
+
+            if existing_pm:
+                existing_pm.is_active = True
+                existing_pm.role = role
+                return existing_pm
+
+            pm = ProjectMembership(
+                project_id=project_id,
+                account_id=target_account_id,
+                organization_id=organization_id,
+                role=role,
+                is_active=True
+            )
+            self._project_memberships[project_id].append(pm)
+            return pm
+
+    def remove_project_member(self, session_id: str, organization_id: str, project_id: str, target_account_id: str) -> None:
+        """Remove a member from a project without deleting historical work assignments."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session or not session.is_valid:
+                raise UnauthorizedException("Invalid or expired session.")
+
+            actor_membership = self._get_membership(organization_id, session.account_id)
+            if not actor_membership or not actor_membership.is_active:
+                raise UnauthorizedOrganizationAccessException("Access denied.")
+
+            project = self._projects.get(project_id)
+            if not project or project.organization_id != organization_id:
+                raise ProjectNotFoundException("Project not found.")
+
+            actor_proj_mems = self._project_memberships.get(project_id, [])
+            is_proj_owner = any(pm.account_id == session.account_id and pm.role == "owner" and pm.is_active for pm in actor_proj_mems)
+            if actor_membership.role not in ("owner", "administrator") and not is_proj_owner:
+                raise InsufficientPermissionException("Insufficient permissions to remove project members.")
+
+            target_pm = None
+            for pm in actor_proj_mems:
+                if pm.account_id == target_account_id and pm.is_active:
+                    target_pm = pm
+                    break
+
+            if not target_pm:
+                raise ProjectMemberNotFoundException("Project member not found.")
+
+            if target_pm.role == "owner":
+                active_owners = [pm for pm in actor_proj_mems if pm.role == "owner" and pm.is_active]
+                if len(active_owners) <= 1:
+                    raise CannotRemoveLastProjectOwnerException("Cannot remove the last project owner.")
+
+            target_pm.is_active = False
+
+    def archive_project(self, session_id: str, organization_id: str, project_id: str) -> Project:
+        """Archive a project, removing it from active views while preserving inspectability."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session or not session.is_valid:
+                raise UnauthorizedException("Invalid or expired session.")
+
+            actor_membership = self._get_membership(organization_id, session.account_id)
+            if not actor_membership or not actor_membership.is_active:
+                raise UnauthorizedOrganizationAccessException("Access denied.")
+
+            project = self._projects.get(project_id)
+            if not project or project.organization_id != organization_id:
+                raise ProjectNotFoundException("Project not found.")
+
+            actor_proj_mems = self._project_memberships.get(project_id, [])
+            is_proj_owner = any(pm.account_id == session.account_id and pm.role == "owner" and pm.is_active for pm in actor_proj_mems)
+            if actor_membership.role not in ("owner", "administrator") and not is_proj_owner:
+                raise InsufficientPermissionException("Insufficient permissions to archive project.")
+
+            project.status = "archived"
+            project.updated_at = datetime.now(timezone.utc)
+            return project
+
+    def delete_project(self, session_id: str, organization_id: str, project_id: str) -> None:
+        """Permanently delete a project and clean up dependent memberships and records."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session or not session.is_valid:
+                raise UnauthorizedException("Invalid or expired session.")
+
+            actor_membership = self._get_membership(organization_id, session.account_id)
+            if not actor_membership or not actor_membership.is_active:
+                raise UnauthorizedOrganizationAccessException("Access denied.")
+
+            project = self._projects.get(project_id)
+            if not project or project.organization_id != organization_id:
+                raise ProjectNotFoundException("Project not found.")
 
             if actor_membership.role not in ("owner", "administrator"):
-                raise InsufficientPermissionsException("Insufficient permissions to remove project members.")
+                raise InsufficientPermissionException("Only organization owners and administrators can delete projects.")
 
-            project_mems = self._project_memberships.get(project_id, [])
-            found = False
-            for pm in project_mems:
-                if pm.account_id == target_account_id and pm.organization_id == organization_id:
-                    pm.is_active = False
-                    found = True
-
-            if not found:
-                raise MemberNotFoundException("Member not found in project.")
-
-            self._audit_logs.append(AuditLog(
-                log_id=secrets.token_hex(6),
-                organization_id=organization_id,
-                actor_account_id=session.account_id,
-                action="REMOVE_FROM_PROJECT",
-                details=f"Removed account {target_account_id} from project {project_id}",
-                timestamp=datetime.now(timezone.utc)
-            ))
+            if project_id in self._projects:
+                del self._projects[project_id]
+            if project_id in self._project_memberships:
+                del self._project_memberships[project_id]
 
     def transfer_ownership(self, session_id: str, organization_id: str, new_owner_account_id: str, previous_owner_new_role: str = "administrator") -> None:
         """Transfer organization ownership to another active member safely under lock."""
