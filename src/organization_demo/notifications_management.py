@@ -18,6 +18,18 @@ class NotificationDeliveryException(Exception):
     """Raised when a notification cannot be delivered to the user."""
 
 
+class NotificationNotFoundException(Exception):
+    """Raised when a requested notification cannot be found."""
+
+
+class EmailSendException(Exception):
+    """Raised when sending an email fails."""
+
+
+class TemplateNotFoundException(Exception):
+    """Raised when a requested email template cannot be found."""
+
+
 class InvalidNotificationPreferenceException(Exception):
     """Raised when an invalid notification preference is supplied."""
 
@@ -261,7 +273,7 @@ class NotificationService:
                         )
                         user_notes[idx] = updated
                     return
-        raise NotificationDeliveryException(
+        raise NotificationNotFoundException(
             f"Notification {notification_id} not found for user {user_id}."
         )
 
@@ -449,8 +461,8 @@ class NotificationService:
                 ),
             )
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            raise EmailSendException(f"Failed to initiate email send for invitation: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Token validation (example utility)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from typing import Any
 
 try:
@@ -24,20 +24,44 @@ class ActivityLogImmutableException(Exception):
     """Raised when an attempt is made to modify an immutable activity record."""
 
 
-def compute_relative_time_label(target_dt: datetime, current_dt: datetime | None = None) -> str:
-    """Compute relative time labels ('today', 'tomorrow', 'yesterday', or formatted date) dynamically."""
-    if current_dt is None:
-        current_dt = datetime.now(timezone.utc)
-    
-    if target_dt.tzinfo is not None and current_dt.tzinfo is not None:
-        target_dt_utc = target_dt.astimezone(timezone.utc)
-        current_dt_utc = current_dt.astimezone(timezone.utc)
-    else:
-        target_dt_utc = target_dt
-        current_dt_utc = current_dt
+class SearchIndexUnavailableException(Exception):
+    """Raised when the search index service is currently unavailable or offline."""
 
-    t_date = target_dt_utc.date()
-    c_date = current_dt_utc.date()
+
+class SearchQueryMalformedException(Exception):
+    """Raised when a search query is malformed, empty, or improperly structured."""
+
+
+class DashboardRenderException(Exception):
+    """Raised when a dashboard summary fails to render correctly."""
+
+
+class ActivityLogPersistenceException(Exception):
+    """Raised when an activity log record cannot be persisted to storage."""
+
+
+class TimezoneParseException(Exception):
+    """Raised when a timezone string cannot be successfully parsed."""
+
+
+def compute_relative_time_label(target_dt: datetime | date, current_dt: datetime | date | None = None) -> str:
+    """Compute relative time labels ('today', 'tomorrow', 'yesterday', or formatted date) dynamically."""
+    if isinstance(target_dt, datetime) and not isinstance(target_dt, date):
+        t_date = target_dt.date()
+    elif isinstance(target_dt, date):
+        t_date = target_dt
+    else:
+        t_date = datetime.now(timezone.utc).date()
+
+    if current_dt is None:
+        c_date = datetime.now(timezone.utc).date()
+    elif isinstance(current_dt, datetime):
+        c_date = current_dt.date()
+    elif isinstance(current_dt, date):
+        c_date = current_dt
+    else:
+        c_date = datetime.now(timezone.utc).date()
+
     delta_days = (t_date - c_date).days
 
     if delta_days == 0:
@@ -67,6 +91,10 @@ class ActivityEntry:
     target_type: str = ""
     target_id: str = ""
     details: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.timestamp.tzinfo is None:
+            object.__setattr__(self, 'timestamp', self.timestamp.replace(tzinfo=timezone.utc))
 
     def __setattr__(self, key: str, value: Any) -> None:
         """Enforce immutability on activity entries."""
@@ -105,6 +133,7 @@ class SearchService:
     def __init__(self) -> None:
         self._index: list[dict[str, Any]] = []
         self._activities: list[ActivityEntry] = []
+        self.index_available: bool = True
 
     def index_document(
         self,
@@ -116,8 +145,11 @@ class SearchService:
         content: str,
         allowed_user_ids: list[str],
         comments: list[str] | None = None,
+        description: str | None = None,
     ) -> None:
-        """Asynchronously or synchronously index an operational document for search, including comments."""
+        """Asynchronously or synchronously index an operational document for search, including comments and descriptions."""
+        if not self.index_available:
+            raise SearchIndexUnavailableException("Search index service is currently unavailable.")
         try:
             doc = {
                 "organization_id": organization_id,
@@ -125,12 +157,12 @@ class SearchService:
                 "item_type": item_type,
                 "item_id": item_id,
                 "title": title,
+                "description": description or "",
                 "content": content,
                 "comments": comments or [],
                 "allowed_user_ids": set(allowed_user_ids),
                 "is_active": True,
             }
-            # Remove existing entry if re-indexing
             self._index = [
                 d for d in self._index
                 if not (d["item_type"] == item_type and d["item_id"] == item_id)
@@ -156,11 +188,15 @@ class SearchService:
         offset: int = 0,
     ) -> list[SearchResult]:
         """Search accessible operational content with partial matching, access boundaries, and pagination."""
+        if not self.index_available:
+            raise SearchIndexUnavailableException("Search index service is currently unavailable.")
         if not user_id or not organization_id:
             raise UnauthorizedSearchAccessException("User identity and organization scope are required for searching.")
+        if not query or not query.strip():
+            raise SearchQueryMalformedException("Search query cannot be empty or malformed.")
 
         results: list[SearchResult] = []
-        query_lower = query.lower()
+        query_lower = query.strip().lower()
         project_ids_set = set(user_project_ids)
 
         for doc in self._index:
@@ -168,25 +204,33 @@ class SearchService:
                 continue
             if not doc.get("is_active", True):
                 continue
-            # Enforce project access if project restricted
             if doc["project_id"] and doc["project_id"] not in project_ids_set:
                 continue
-            # Enforce user access permission boundary
             if user_id not in doc["allowed_user_ids"]:
                 continue
 
             title = doc["title"]
+            description = doc.get("description", "")
             content = doc["content"]
             comments = doc.get("comments", [])
+
             title_lower = title.lower()
+            desc_lower = description.lower()
             content_lower = content.lower()
             comments_lower = [c.lower() for c in comments]
 
             matched = False
             snippet_source = content
 
-            if query_lower in title_lower or query_lower in content_lower:
+            if query_lower in title_lower:
                 matched = True
+                snippet_source = title
+            elif query_lower in desc_lower:
+                matched = True
+                snippet_source = description
+            elif query_lower in content_lower:
+                matched = True
+                snippet_source = content
             else:
                 for c_text in comments_lower:
                     if query_lower in c_text:
@@ -214,7 +258,6 @@ class SearchService:
                     )
                 )
 
-        # Stable ordering across pages using item_type and item_id as secondary keys
         sorted_results = sorted(results, key=lambda x: (x.item_type, x.item_id))
         return sorted_results[offset:offset + limit]
 
@@ -229,19 +272,25 @@ class SearchService:
         details: dict[str, Any] | None = None,
     ) -> ActivityEntry:
         """Record a significant user or system activity into the append-only activity feed."""
-        entry = ActivityEntry(
-            activity_id=f"act_{len(self._activities) + 1}_{int(datetime.now(timezone.utc).timestamp())}",
-            organization_id=organization_id,
-            action=action,
-            timestamp=datetime.now(timezone.utc),
-            actor_id=actor_id,
-            actor_name=actor_name,
-            target_type=target_type,
-            target_id=target_id,
-            details=details or {},
-        )
-        self._activities.append(entry)
-        return entry
+        if action.startswith("INTERNAL_") or action.startswith("CACHE_") or action.startswith("EMAIL_"):
+            raise ActivityLogPersistenceException("Internal database and background operations are not recorded in activity feeds.")
+        
+        try:
+            entry = ActivityEntry(
+                activity_id=f"act_{len(self._activities) + 1}_{int(datetime.now(timezone.utc).timestamp())}",
+                organization_id=organization_id,
+                action=action,
+                timestamp=datetime.now(timezone.utc),
+                actor_id=actor_id,
+                actor_name=actor_name,
+                target_type=target_type,
+                target_id=target_id,
+                details=details or {},
+            )
+            self._activities.append(entry)
+            return entry
+        except Exception as exc:
+            raise ActivityLogPersistenceException(f"Failed to record activity log: {exc}") from exc
 
     def list_activities(
         self,
@@ -256,14 +305,12 @@ class SearchService:
             if act.organization_id == organization_id
         ]
         
-        # If not admin, exclude high-privilege or sensitive internal/administrative audit events
         if not is_admin:
             filtered = [
                 act for act in filtered
                 if not act.action.startswith("ADMIN_") and not act.action.startswith("INTERNAL_")
             ]
         else:
-            # Administrators see everything except core internal background system tasks
             filtered = [
                 act for act in filtered
                 if not act.action.startswith("INTERNAL_")
@@ -281,76 +328,82 @@ class SearchService:
         timezone_str: str = "UTC",
     ) -> DashboardSummary:
         """Derive active projects, assigned work, and recent updates for the user dashboard."""
-        target_tz = timezone.utc
-        if ZoneInfo is not None:
-            try:
-                target_tz = ZoneInfo(timezone_str)
-            except Exception:
-                target_tz = timezone.utc
+        try:
+            target_tz = timezone.utc
+            if ZoneInfo is not None:
+                try:
+                    target_tz = ZoneInfo(timezone_str)
+                except Exception as tz_exc:
+                    raise TimezoneParseException(f"Could not parse timezone {timezone_str}") from tz_exc
 
-        def _localize_dt(val: Any) -> Any:
-            if isinstance(val, datetime):
-                if val.tzinfo is None:
-                    val = val.replace(tzinfo=timezone.utc)
-                return val.astimezone(target_tz)
-            return val
+            def _localize_dt(val: Any) -> Any:
+                if isinstance(val, datetime):
+                    if val.tzinfo is None:
+                        val = val.replace(tzinfo=timezone.utc)
+                    return val.astimezone(target_tz)
+                return val
 
-        active_projects = []
-        for p in projects:
-            if p.get("organization_id") == organization_id and p.get("status") not in ("completed", "archived"):
-                p_copy = dict(p)
-                if "due_date" in p_copy:
-                    p_copy["due_date"] = _localize_dt(p_copy["due_date"])
-                if "updated_at" in p_copy:
-                    p_copy["updated_at"] = _localize_dt(p_copy["updated_at"])
-                active_projects.append(p_copy)
+            active_projects = []
+            for p in projects:
+                if p.get("organization_id") == organization_id and p.get("status") not in ("completed", "archived"):
+                    p_copy = dict(p)
+                    if "due_date" in p_copy:
+                        p_copy["due_date"] = _localize_dt(p_copy["due_date"])
+                    if "updated_at" in p_copy:
+                        p_copy["updated_at"] = _localize_dt(p_copy["updated_at"])
+                    active_projects.append(p_copy)
 
-        assigned_work = []
-        for w in work_items:
-            if (
-                w.get("organization_id") == organization_id
-                and w.get("assignee_id") == user_id
+            assigned_work = []
+            for w in work_items:
+                if (
+                    w.get("organization_id") == organization_id
+                    and w.get("assignee_id") == user_id
+                    and w.get("status") not in ("completed", "archived")
+                ):
+                    w_copy = dict(w)
+                    if "due_date" in w_copy:
+                        w_copy["due_date"] = _localize_dt(w_copy["due_date"])
+                    if "updated_at" in w_copy:
+                        w_copy["updated_at"] = _localize_dt(w_copy["updated_at"])
+                    assigned_work.append(w_copy)
+
+            raw_recently_updated = [
+                w for w in work_items
+                if w.get("organization_id") == organization_id
                 and w.get("status") not in ("completed", "archived")
-            ):
+                and (w.get("assignee_id") == user_id or w.get("member_involved", False))
+            ]
+
+            sorted_recently_updated = sorted(
+                raw_recently_updated,
+                key=lambda x: x.get("last_meaningful_update", x.get("updated_at", datetime.min)),
+                reverse=True,
+            )[:10]
+
+            recently_updated = []
+            for w in sorted_recently_updated:
                 w_copy = dict(w)
-                if "due_date" in w_copy:
-                    w_copy["due_date"] = _localize_dt(w_copy["due_date"])
+                if "last_meaningful_update" in w_copy:
+                    w_copy["last_meaningful_update"] = _localize_dt(w_copy["last_meaningful_update"])
                 if "updated_at" in w_copy:
                     w_copy["updated_at"] = _localize_dt(w_copy["updated_at"])
-                assigned_work.append(w_copy)
+                if "due_date" in w_copy:
+                    w_copy["due_date"] = _localize_dt(w_copy["due_date"])
+                recently_updated.append(w_copy)
 
-        raw_recently_updated = [
-            w for w in work_items
-            if w.get("organization_id") == organization_id
-            and (w.get("assignee_id") == user_id or w.get("member_involved", False))
-        ]
+            empty_message = None
+            if not assigned_work and not active_projects:
+                empty_message = "You have no active projects or assigned work items at this time."
 
-        sorted_recently_updated = sorted(
-            raw_recently_updated,
-            key=lambda x: x.get("last_meaningful_update", x.get("updated_at", datetime.min)),
-            reverse=True,
-        )[:10]
-
-        recently_updated = []
-        for w in sorted_recently_updated:
-            w_copy = dict(w)
-            if "last_meaningful_update" in w_copy:
-                w_copy["last_meaningful_update"] = _localize_dt(w_copy["last_meaningful_update"])
-            if "updated_at" in w_copy:
-                w_copy["updated_at"] = _localize_dt(w_copy["updated_at"])
-            if "due_date" in w_copy:
-                w_copy["due_date"] = _localize_dt(w_copy["due_date"])
-            recently_updated.append(w_copy)
-
-        empty_message = None
-        if not assigned_work and not active_projects:
-            empty_message = "You have no active projects or assigned work items at this time."
-
-        return DashboardSummary(
-            organization_id=organization_id,
-            user_id=user_id,
-            active_projects=active_projects,
-            assigned_work_items=assigned_work,
-            recently_updated_items=recently_updated,
-            empty_state_message=empty_message,
-        )
+            return DashboardSummary(
+                organization_id=organization_id,
+                user_id=user_id,
+                active_projects=active_projects,
+                assigned_work_items=assigned_work,
+                recently_updated_items=recently_updated,
+                empty_state_message=empty_message,
+            )
+        except Exception as exc:
+            if isinstance(exc, TimezoneParseException):
+                raise
+            raise DashboardRenderException(f"Failed to render dashboard summary: {exc}") from exc
